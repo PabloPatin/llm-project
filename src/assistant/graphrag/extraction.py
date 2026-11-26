@@ -9,48 +9,19 @@ from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import EXTRACTION_SCHEMA, Chunk, Entity, ExtractionResult, Relation
 
 _PROMPT = (
-    "Ты — эксперт по извлечению структурированных данных из технических текстов. "
-    "Твоя задача — извлечь сущности и связи из предоставленного текста. "
-    "Ты должен вернуть ТОЛЬКО валидный JSON, без какого-либо дополнительного текста, комментариев или Markdown-форматирования.\n\n"
-
-    "### ПРАВИЛА ИЗВЛЕЧЕНИЯ:\n"
-    "1. Сущности (entities) — это объекты, детали, модели, ошибки, процедуры или поставщики, упомянутые в тексте.\n"
-    "2. Связи (relations) — это направленные связи между сущностями.\n"
-    "3. Связь должна строго соответствовать допустимым типам (см. ниже). Если связь не подходит под сигнатуру, НЕ извлекай её.\n"
-    "4. Используй ТОЛЬКО сущности, которые ты извлек в массиве 'entities'. Не придумывай новые имена.\n\n"
-
-    "### ДОПУСТИМЫЕ ТИПЫ СУЩНОСТЕЙ:\n"
-    "- ProductLine: линейка продуктов\n"
-    "- Model: конкретная модель\n"
-    "- Component: компонент (узел)\n"
-    "- Part: деталь (артикул)\n"
-    "- ErrorCode: код ошибки\n"
-    "- Procedure: процедура ремонта/действие\n"
-    "- Supplier: поставщик\n\n"
-
-    "### ДОПУСТИМЫЕ ТИПЫ СВЯЗЕЙ (строго по сигнатуре subject_type -> object_type):\n"
-    "- BELONGS_TO: Model -> ProductLine\n"
-    "- HAS_PART: Model -> Part\n"
-    "- IS_A: Part -> Component\n"
-    "- INDICATES: ErrorCode -> Component\n"
-    "- FIXED_BY: ErrorCode -> Procedure\n"
-    "- REPLACED_BY: Part -> Part\n"
-    "- SUPPLIED_BY: Part -> Supplier\n"
-    "- FAILED: Model -> Component\n\n"
-
-    "### ФОРМАТ ОТВЕТА (строгий JSON):\n"
-    "{\n"
-    '  "entities": [\n'
-    '    {"type": "Model", "name": "AR-210"},\n'
-    '    {"type": "Component", "name": "пусковое реле"},\n'
-    '    {"type": "Part", "name": "P-1042"}\n'
-    "  ],\n"
-    '  "relations": [\n'
-    '    {"subject_type": "Model", "subject": "AR-210", "type": "HAS_PART", "object_type": "Part", "object": "P-1042"}\n'
-    "  ]\n"
-    "}\n\n"
-
-    "### ТЕКСТ ДЛЯ АНАЛИЗА:\n"
+    "Извлеки сущности и связи. Верни ТОЛЬКО JSON.\n\n"
+    "ГЛАВНЫЕ ПРАВИЛА:\n"
+    "1. Извлекай ВСЕ логичные связи, даже неявные (если деталь упомянута в контексте модели — это HAS_PART).\n"
+    "2. Имена сущностей и коды бери ДОСЛОВНО из текста (символ в символ, как написано). "
+    "Не меняй регистр, не добавляй дефисы, не сокращай.\n\n"
+    "ТИПЫ СУЩНОСТЕЙ: ProductLine, Model, Component, Part, ErrorCode, Procedure, Supplier.\n"
+    "ТИПЫ СВЯЗЕЙ (subject -> object):\n"
+    "BELONGS_TO: Model->ProductLine, HAS_PART: Model->Part, IS_A: Part->Component, "
+    "INDICATES: ErrorCode->Component, FIXED_BY: ErrorCode->Procedure, "
+    "REPLACED_BY: Part->Part, SUPPLIED_BY: Part->Supplier, FAILED: Model->Component.\n\n"
+    "ФОРМАТ:\n"
+    '{"entities":[{"type":"Model","name":"A"}],"relations":[{"subject_type":"Model","subject":"A","type":"HAS_PART","object_type":"Part","object":"B"}]}\n\n'
+    "ТЕКСТ:\n"
 )
 
 vocabulary_path = Path(__file__).resolve().parents[3] / "data" / "vocabulary.json"
