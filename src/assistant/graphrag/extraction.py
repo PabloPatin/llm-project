@@ -1,30 +1,31 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 import json
+import re
 from pathlib import Path
 
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from assistant.graphrag.extraction_prompts import relation_prompt
 from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes, load_vocabulary
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import EXTRACTION_SCHEMA, Chunk, Entity, ExtractionResult, Relation
-
-_PROMPT = (
-    "Извлеки сущности и связи. Верни ТОЛЬКО JSON.\n\n"
-    "ГЛАВНЫЕ ПРАВИЛА:\n"
-    "1. Извлекай ВСЕ логичные связи, даже неявные (если деталь упомянута в контексте модели — это HAS_PART).\n"
-    "2. Имена сущностей и коды бери ДОСЛОВНО из текста (символ в символ, как написано). "
-    "Не меняй регистр, не добавляй дефисы, не сокращай.\n\n"
-    "ТИПЫ СУЩНОСТЕЙ: ProductLine, Model, Component, Part, ErrorCode, Procedure, Supplier.\n"
-    "ТИПЫ СВЯЗЕЙ (subject -> object):\n"
-    "BELONGS_TO: Model->ProductLine, HAS_PART: Model->Part, IS_A: Part->Component, "
-    "INDICATES: ErrorCode->Component, FIXED_BY: ErrorCode->Procedure, "
-    "REPLACED_BY: Part->Part, SUPPLIED_BY: Part->Supplier, FAILED: Model->Component.\n\n"
-    "ФОРМАТ:\n"
-    '{"entities":[{"type":"Model","name":"A"}],"relations":[{"subject_type":"Model","subject":"A","type":"HAS_PART","object_type":"Part","object":"B"}]}\n\n'
-    "ТЕКСТ:\n"
-)
+from assistant.infra.schemas import EXTRACTION_SCHEMA, RELATION_SIGNATURES, Chunk, Entity, ExtractionResult, Relation
 
 vocabulary_path = Path(__file__).resolve().parents[3] / "data" / "vocabulary.json"
+
+
+_ERROR_CODE_ROW = re.compile(r"\s*(?:[-+*]|\|)\s*[eе][- ]?\d{2}(?!\w)", re.IGNORECASE)
+
+
+def _incident_text(text: str) -> str:
+    """Убирает строки справочника кодов из входа для извлечения FAILED."""
+    in_error_reference = False
+    lines = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("## "):
+            in_error_reference = line.removeprefix("## ").strip().casefold() == "коды ошибок"
+        if not in_error_reference or not _ERROR_CODE_ROW.match(line):
+            lines.append(line)
+    return "".join(lines)
 
 
 @retry(
@@ -38,9 +39,9 @@ vocabulary_path = Path(__file__).resolve().parents[3] / "data" / "vocabulary.jso
         f"LLM call failed (attempt {retry_state.attempt_number}): {retry_state.outcome.exception()}"
     ),
 )
-def _ask(chunk_text: str, llm: LLMClient) -> dict:
+def _ask(chunk_text: str, llm: LLMClient, kind: str) -> dict | None:
     resp = llm.chat(
-        [{"role": "user", "content": _PROMPT + chunk_text}],
+        [{"role": "user", "content": relation_prompt(kind) + chunk_text}],
         json_schema=EXTRACTION_SCHEMA,
     )
     raw = getattr(resp, "content", resp)
@@ -58,6 +59,8 @@ def _ask(chunk_text: str, llm: LLMClient) -> dict:
 def _resolve(entity_type: str, entity_raw_name: str, vocabulary: dict[str, list[str]], text_codes) -> str | None:
     # нет заготовленного списка правильных кодов,
     # метод проверяет именно валидность вытащенного ЛЛМкой кода, но не то встречался ли он в тексте
+    if not isinstance(entity_type, str) or not isinstance(entity_raw_name, str):
+        return None
     entity_name = canonical_name(entity_type, entity_raw_name, vocabulary)
     if entity_name is None:
         return None
@@ -70,15 +73,20 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     """Возвращает сущности и связи чанка строго по схеме графа.
 
     Модель вызывается через `llm.chat(..., json_schema=EXTRACTION_SCHEMA)`. Запрос описывает схему
-    с направлением каждой связи и содержит хотя бы один пример. Всё, что не подтверждается текстом,
-    отбрасывается и считается в `dropped`: код, которого нет в чанке, название не из словаря,
+    с направлением целевой связи и содержит пример. Запросы выполняются последовательно по типам.
+    Неподтверждённые записи отбрасываются и учитываются в `dropped`: код, которого нет в чанке, название не из словаря,
     связь с отброшенным концом. Пригодятся `find_codes` и `canonical_name` из `assistant.infra.grounding`.
-    Функция не падает ни на каком ответе модели: одна повторная попытка, затем пустой результат.
+    Для каждого запроса предусмотрена одна повторная попытка. Остальные ответы сохраняются.
     """
 
-    data = _ask(chunk.text, llm)
-    if data is None:
-        return ExtractionResult(chunk.chunk_id, chunk.doc_id, [], [], dropped=0)
+    entities = []
+    responses = []
+    for kind in RELATION_SIGNATURES:
+        text = _incident_text(chunk.text) if kind == "FAILED" else chunk.text
+        data = _ask(text, llm, kind)
+        if data is not None:
+            entities.extend(data["entities"])
+            responses.extend((kind, relation) for relation in data["relations"])
 
     text_codes = set(find_codes(chunk.text))
     kept: dict[str, Entity] = {}
@@ -87,7 +95,10 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     vocabulary = load_vocabulary(vocabulary_path)
 
     # entities
-    for entity in data["entities"]:
+    for entity in entities:
+        if not isinstance(entity, dict):
+            dropped += 1
+            continue
         entity_type, entity_name = entity.get("type"), entity.get("name")
         entity_name = _resolve(entity_type, entity_name, vocabulary, text_codes)
         if entity_name is None:
@@ -98,7 +109,8 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
 
     # relations
     relations: list[Relation] = []
-    for relation in data["relations"]:
+    seen_relations: set[Relation] = set()
+    for kind, relation in responses:
         if not isinstance(relation, dict):
             dropped += 1
             continue
@@ -106,6 +118,9 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
             relation.get("subject_type"), relation.get("subject"),
             relation.get("object_type"), relation.get("object"), relation.get("type"),
         )
+        if relation_type != kind or (subject_entity_type, object_entity_type) != RELATION_SIGNATURES[kind]:
+            dropped += 1
+            continue
         subject_entity_name = _resolve(subject_entity_type, subject_entity_name, vocabulary, text_codes)
         object_entity_name = _resolve(object_entity_type, object_entity_name, vocabulary, text_codes)
         if subject_entity_name is None or object_entity_name is None:
@@ -115,6 +130,12 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
                                      Entity(object_entity_type, object_entity_name))
         kept.setdefault(subject_node.node_id, subject_node)
         kept.setdefault(object_node.node_id, object_node)
-        relations.append(Relation(subject_node, relation_type, object_node))
+        edge = Relation(subject_node, relation_type, object_node)
+        if subject_node == object_node:
+            dropped += 1
+            continue
+        if edge not in seen_relations:
+            seen_relations.add(edge)
+            relations.append(edge)
 
     return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(kept.values()), relations, dropped=dropped)
