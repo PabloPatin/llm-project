@@ -1,109 +1,141 @@
-"""Последовательное извлечение связей и сущностей одного чанка."""
-
+"""Извлечение сущностей и связей из чанка. Требование FR-1."""
 import json
+import re
 from pathlib import Path
 
-from assistant.graphrag.extraction_prompts import FAILED_CONTEXTS, PAIR_FIELDS, relation_prompt
-from assistant.infra.grounding import (
-    CODE_TYPES,
-    canonical_name,
-    code_type,
-    find_codes,
-    find_names,
-    load_vocabulary,
-)
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from assistant.graphrag.extraction_prompts import relation_prompt
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes, load_vocabulary
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import RELATION_SIGNATURES, Chunk, Entity, ExtractionResult, Relation
+from assistant.infra.schemas import EXTRACTION_SCHEMA, RELATION_SIGNATURES, Chunk, Entity, ExtractionResult, Relation
 
 vocabulary_path = Path(__file__).resolve().parents[3] / "data" / "vocabulary.json"
 
 
-def _pair_schema(kind: str) -> dict:
-    fields = PAIR_FIELDS[kind]
-    properties = {
-        "pairs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {name: {"type": "string"} for name in fields},
-                "required": list(fields),
-                "additionalProperties": False,
-            },
-        },
-    }
-    required = ["pairs"]
-    if kind == "FAILED":
-        properties["context"] = {"type": "string", "enum": list(FAILED_CONTEXTS)}
-        required.insert(0, "context")
-    return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+_ERROR_CODE_ROW = re.compile(r"\s*(?:[-+*]|\|)\s*[eе][- ]?\d{2}(?!\w)", re.IGNORECASE)
 
 
-def _ask_pairs(kind: str, text: str, llm: LLMClient) -> list | None:
-    prompt = relation_prompt(kind) + text
-    schema = _pair_schema(kind)
-    retry_prompt = "Предыдущий ответ не удалось разобрать. Верни только JSON по указанной схеме.\n\n"
-    # У второй попытки отдельный ключ кеша: некорректный JSON мог сохраниться после первого вызова.
-    for content in (prompt, retry_prompt + prompt):
-        try:
-            data = json.loads(llm.chat([{"role": "user", "content": content}], json_schema=schema).content)
-            if not isinstance(data, dict) or not isinstance(data.get("pairs"), list):
-                continue
-            if kind == "FAILED":
-                context = data.get("context")
-                if context not in FAILED_CONTEXTS:
-                    continue
-                if context != "incident":
-                    return []
-            return data["pairs"]
-        except (ValueError, RuntimeError, ConnectionError, TimeoutError):
-            continue
-    return None
+def _incident_text(text: str) -> str:
+    """Убирает строки справочника кодов из входа для извлечения FAILED."""
+    in_error_reference = False
+    lines = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("## "):
+            in_error_reference = line.removeprefix("## ").strip().casefold() == "коды ошибок"
+        if not in_error_reference or not _ERROR_CODE_ROW.match(line):
+            lines.append(line)
+    return "".join(lines)
 
 
-def _resolve(entity_type: str, raw: object, vocabulary: dict[str, list[str]], codes: set[str]) -> Entity | None:
-    if not isinstance(raw, str):
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(
+        (json.JSONDecodeError, ValueError, RuntimeError, ConnectionError, TimeoutError)
+    ),
+    retry_error_callback=lambda e: None,
+    before_sleep=lambda retry_state: print(
+        f"LLM call failed (attempt {retry_state.attempt_number}): {retry_state.outcome.exception()}"
+    ),
+)
+def _ask(chunk_text: str, llm: LLMClient, kind: str) -> dict | None:
+    resp = llm.chat(
+        [{"role": "user", "content": relation_prompt(kind) + chunk_text}],
+        json_schema=EXTRACTION_SCHEMA,
+    )
+    raw = getattr(resp, "content", resp)
+    data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+    if (
+            isinstance(data, dict)
+            and isinstance(data.get("entities"), list)
+            and isinstance(data.get("relations"), list)
+    ):
+        return data
+
+    raise ValueError(f"Invalid schema returned: {data}")
+
+
+def _resolve(entity_type: str, entity_raw_name: str, vocabulary: dict[str, list[str]], text_codes) -> str | None:
+    # нет заготовленного списка правильных кодов,
+    # метод проверяет именно валидность вытащенного ЛЛМкой кода, но не то встречался ли он в тексте
+    if not isinstance(entity_type, str) or not isinstance(entity_raw_name, str):
         return None
-    name = canonical_name(entity_type, raw, vocabulary)
-    if name is None or (entity_type in CODE_TYPES and name not in codes):
+    entity_name = canonical_name(entity_type, entity_raw_name, vocabulary)
+    if entity_name is None:
         return None
-    return Entity(entity_type, name)
+    if entity_type in CODE_TYPES and entity_name not in text_codes:
+        return None
+    return entity_name
 
 
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
-    """Собирает пары из отдельных запросов, нормализует сущности и сохраняет источник чанка."""
-    vocabulary = load_vocabulary(vocabulary_path)
-    codes = set(find_codes(chunk.text))
-    entities: dict[str, Entity] = {}
-    relations: dict[tuple[str, str, str], Relation] = {}
+    """Возвращает сущности и связи чанка строго по схеме графа.
+
+    Модель вызывается через `llm.chat(..., json_schema=EXTRACTION_SCHEMA)`. Запрос описывает схему
+    с направлением целевой связи и содержит пример. Запросы выполняются последовательно по типам.
+    Неподтверждённые записи отбрасываются и учитываются в `dropped`: код, которого нет в чанке, название не из словаря,
+    связь с отброшенным концом. Пригодятся `find_codes` и `canonical_name` из `assistant.infra.grounding`.
+    Для каждого запроса предусмотрена одна повторная попытка. Остальные ответы сохраняются.
+    """
+
+    entities = []
+    responses = []
+    for kind in RELATION_SIGNATURES:
+        text = _incident_text(chunk.text) if kind == "FAILED" else chunk.text
+        data = _ask(text, llm, kind)
+        if data is not None:
+            entities.extend(data["entities"])
+            responses.extend((kind, relation) for relation in data["relations"])
+
+    text_codes = set(find_codes(chunk.text))
+    kept: dict[str, Entity] = {}
     dropped = 0
-    answered = False
 
-    for kind, (subject_type, object_type) in RELATION_SIGNATURES.items():
-        pairs = _ask_pairs(kind, chunk.text, llm)
-        if pairs is None:
+    vocabulary = load_vocabulary(vocabulary_path)
+
+    # entities
+    for entity in entities:
+        if not isinstance(entity, dict):
+            dropped += 1
             continue
-        answered = True
-        subject_field, object_field = PAIR_FIELDS[kind]
-        for pair in pairs:
-            if not isinstance(pair, dict):
-                dropped += 1
-                continue
-            subject = _resolve(subject_type, pair.get(subject_field), vocabulary, codes)
-            object_ = _resolve(object_type, pair.get(object_field), vocabulary, codes)
-            if subject is None or object_ is None or subject == object_:
-                dropped += 1
-                continue
-            entities[subject.node_id] = subject
-            entities[object_.node_id] = object_
-            relations[(subject.node_id, kind, object_.node_id)] = Relation(subject, kind, object_)
+        entity_type, entity_name = entity.get("type"), entity.get("name")
+        entity_name = _resolve(entity_type, entity_name, vocabulary, text_codes)
+        if entity_name is None:
+            dropped += 1
+            continue
 
-    if answered:
-        # Явные упоминания образуют узлы даже тогда, когда для них не найдено связей.
-        for code in sorted(codes):
-            entity = Entity(code_type(code), code)
-            entities.setdefault(entity.node_id, entity)
-        for kind, name in find_names(chunk.text, vocabulary):
-            entity = Entity(kind, name)
-            entities.setdefault(entity.node_id, entity)
+        kept.setdefault(f"{entity_type}:{entity_name}", Entity(entity_type, entity_name))
 
-    return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(entities.values()), list(relations.values()), dropped)
+    # relations
+    relations: list[Relation] = []
+    seen_relations: set[Relation] = set()
+    for kind, relation in responses:
+        if not isinstance(relation, dict):
+            dropped += 1
+            continue
+        subject_entity_type, subject_entity_name, object_entity_type, object_entity_name, relation_type = (
+            relation.get("subject_type"), relation.get("subject"),
+            relation.get("object_type"), relation.get("object"), relation.get("type"),
+        )
+        if relation_type != kind or (subject_entity_type, object_entity_type) != RELATION_SIGNATURES[kind]:
+            dropped += 1
+            continue
+        subject_entity_name = _resolve(subject_entity_type, subject_entity_name, vocabulary, text_codes)
+        object_entity_name = _resolve(object_entity_type, object_entity_name, vocabulary, text_codes)
+        if subject_entity_name is None or object_entity_name is None:
+            dropped += 1
+            continue
+        subject_node, object_node = (Entity(subject_entity_type, subject_entity_name),
+                                     Entity(object_entity_type, object_entity_name))
+        kept.setdefault(subject_node.node_id, subject_node)
+        kept.setdefault(object_node.node_id, object_node)
+        edge = Relation(subject_node, relation_type, object_node)
+        if subject_node == object_node:
+            dropped += 1
+            continue
+        if edge not in seen_relations:
+            seen_relations.add(edge)
+            relations.append(edge)
+
+    return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(kept.values()), relations, dropped=dropped)
